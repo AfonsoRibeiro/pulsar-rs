@@ -21,7 +21,7 @@ use futures::{
     Future, FutureExt, Sink, SinkExt, Stream, StreamExt,
 };
 #[cfg(any(feature = "tokio-runtime", feature = "async-std-runtime"))]
-use native_tls::Certificate;
+use native_tls::{Certificate, Identity};
 use proto::MessageIdData;
 use rand::{seq::SliceRandom, thread_rng};
 #[cfg(all(
@@ -756,6 +756,9 @@ impl<Exe: Executor> Connection<Exe> {
         auth_data: Option<Arc<Mutex<Box<dyn crate::authentication::Authentication>>>>,
         proxy_to_broker_url: Option<String>,
         certificate_chain: &[Certificate],
+        #[cfg(any(feature = "tokio-runtime", feature = "async-std-runtime"))] identity: &Option<
+            Identity,
+        >,
         allow_insecure_connection: bool,
         tls_hostname_verification_enabled: bool,
         connection_timeout: Duration,
@@ -814,6 +817,8 @@ impl<Exe: Executor> Connection<Exe> {
                 auth_data.clone(),
                 proxy_to_broker_url.clone(),
                 certificate_chain,
+                #[cfg(any(feature = "tokio-runtime", feature = "async-std-runtime"))]
+                identity.clone(),
                 allow_insecure_connection,
                 tls_hostname_verification_enabled,
                 executor.clone(),
@@ -891,6 +896,9 @@ impl<Exe: Executor> Connection<Exe> {
         auth: Option<Arc<Mutex<Box<dyn crate::authentication::Authentication>>>>,
         proxy_to_broker_url: Option<String>,
         certificate_chain: &[Certificate],
+        #[cfg(any(feature = "tokio-runtime", feature = "async-std-runtime"))] identity: Option<
+            Identity,
+        >,
         allow_insecure_connection: bool,
         tls_hostname_verification_enabled: bool,
         executor: Arc<Exe>,
@@ -905,6 +913,9 @@ impl<Exe: Executor> Connection<Exe> {
                     let mut builder = native_tls::TlsConnector::builder();
                     for certificate in certificate_chain {
                         builder.add_root_certificate(certificate.clone());
+                    }
+                    if let Some(identity) = identity {
+                        builder.identity(identity);
                     }
                     builder.danger_accept_invalid_hostnames(
                         allow_insecure_connection && !tls_hostname_verification_enabled,
@@ -1015,6 +1026,9 @@ impl<Exe: Executor> Connection<Exe> {
                     let mut connector = async_native_tls::TlsConnector::new();
                     for certificate in certificate_chain {
                         connector = connector.add_root_certificate(certificate.clone());
+                    }
+                    if let Some(identity) = identity {
+                        connector = connector.identity(identity);
                     }
                     connector = connector.danger_accept_invalid_hostnames(
                         allow_insecure_connection && !tls_hostname_verification_enabled,
