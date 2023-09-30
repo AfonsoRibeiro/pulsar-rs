@@ -20,9 +20,15 @@ use futures::{
     task::{Context, Poll},
     Future, FutureExt, Sink, SinkExt, Stream, StreamExt,
 };
-use native_tls::Certificate;
+#[cfg(any(feature = "tokio-runtime", feature = "async-std-runtime"))]
+use native_tls::{Certificate, Identity};
 use proto::MessageIdData;
 use rand::{seq::SliceRandom, thread_rng};
+#[cfg(all(
+    any(feature = "tokio-rustls-runtime", feature = "async-std-rustls-runtime"),
+    not(any(feature = "tokio-runtime", feature = "async-std-runtime"))
+))]
+use rustls::Certificate;
 use url::Url;
 use uuid::Uuid;
 
@@ -722,6 +728,19 @@ impl<Exe: Executor> ConnectionSender<Exe> {
             _ => Err(ConnectionError::Disconnected),
         }
     }
+
+    pub(crate) async fn get_schema(
+        &self,
+        topic: &str,
+        version: Option<Vec<u8>>,
+    ) -> Result<proto::CommandGetSchemaResponse, ConnectionError> {
+        let request_id = self.request_id.get();
+        let msg = messages::get_schema(request_id, topic, version);
+        self.send_message(msg, RequestKey::RequestId(request_id), |resp| {
+            resp.command.get_schema_response
+        })
+        .await
+    }
 }
 
 pub struct Connection<Exe: Executor> {
@@ -737,6 +756,9 @@ impl<Exe: Executor> Connection<Exe> {
         auth_data: Option<Arc<Mutex<Box<dyn crate::authentication::Authentication>>>>,
         proxy_to_broker_url: Option<String>,
         certificate_chain: &[Certificate],
+        #[cfg(any(feature = "tokio-runtime", feature = "async-std-runtime"))] identity: &Option<
+            Identity,
+        >,
         allow_insecure_connection: bool,
         tls_hostname_verification_enabled: bool,
         connection_timeout: Duration,
@@ -795,6 +817,8 @@ impl<Exe: Executor> Connection<Exe> {
                 auth_data.clone(),
                 proxy_to_broker_url.clone(),
                 certificate_chain,
+                #[cfg(any(feature = "tokio-runtime", feature = "async-std-runtime"))]
+                identity.clone(),
                 allow_insecure_connection,
                 tls_hostname_verification_enabled,
                 executor.clone(),
@@ -852,16 +876,18 @@ impl<Exe: Executor> Connection<Exe> {
         match auth {
             Some(m_auth) => {
                 let mut auth_guard = m_auth.lock().await;
-                Ok(Some(Authentication {
-                    name: auth_guard.auth_method_name(),
-                    data: auth_guard.auth_data().await?,
-                }))
+                let name = auth_guard.auth_method_name();
+                // wrap the future of auth_data() with Shared so that it implements Sync
+                let data_fut = auth_guard.auth_data().shared();
+                let data = data_fut.await?;
+                Ok(Some(Authentication { name, data }))
             }
             None => Ok(None),
         }
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    #[allow(unused_variables)] // allow_insecure_connection and tls_hostname_verification_enabled are native-tls only
     async fn prepare_stream(
         connection_id: Uuid,
         address: SocketAddr,
@@ -870,6 +896,9 @@ impl<Exe: Executor> Connection<Exe> {
         auth: Option<Arc<Mutex<Box<dyn crate::authentication::Authentication>>>>,
         proxy_to_broker_url: Option<String>,
         certificate_chain: &[Certificate],
+        #[cfg(any(feature = "tokio-runtime", feature = "async-std-runtime"))] identity: Option<
+            Identity,
+        >,
         allow_insecure_connection: bool,
         tls_hostname_verification_enabled: bool,
         executor: Arc<Exe>,
@@ -884,6 +913,9 @@ impl<Exe: Executor> Connection<Exe> {
                     let mut builder = native_tls::TlsConnector::builder();
                     for certificate in certificate_chain {
                         builder.add_root_certificate(certificate.clone());
+                    }
+                    if let Some(identity) = identity {
+                        builder.identity(identity);
                     }
                     builder.danger_accept_invalid_hostnames(
                         allow_insecure_connection && !tls_hostname_verification_enabled,
@@ -921,7 +953,69 @@ impl<Exe: Executor> Connection<Exe> {
                     .await
                 }
             }
-            #[cfg(not(feature = "tokio-runtime"))]
+            #[cfg(all(feature = "tokio-rustls-runtime", not(feature = "tokio-runtime")))]
+            ExecutorKind::Tokio => {
+                if tls {
+                    let stream = tokio::net::TcpStream::connect(&address).await?;
+                    let mut root_store = rustls::RootCertStore::empty();
+                    for certificate in certificate_chain {
+                        root_store.add(certificate)?;
+                    }
+
+                    let trust_anchors = webpki_roots::TLS_SERVER_ROOTS.iter().fold(
+                        vec![],
+                        |mut acc, trust_anchor| {
+                            acc.push(
+                                rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
+                                    trust_anchor.subject,
+                                    trust_anchor.spki,
+                                    trust_anchor.name_constraints,
+                                ),
+                            );
+                            acc
+                        },
+                    );
+
+                    root_store.add_trust_anchors(trust_anchors.into_iter());
+                    let config = rustls::ClientConfig::builder()
+                        .with_safe_default_cipher_suites()
+                        .with_safe_default_kx_groups()
+                        .with_safe_default_protocol_versions()?
+                        .with_root_certificates(root_store)
+                        .with_no_client_auth();
+
+                    let cx = tokio_rustls::TlsConnector::from(Arc::new(config));
+                    let stream = cx
+                        .connect(rustls::ServerName::try_from(hostname.as_str())?, stream)
+                        .await
+                        .map(|stream| tokio_util::codec::Framed::new(stream, Codec))?;
+
+                    Connection::connect(
+                        connection_id,
+                        stream,
+                        auth,
+                        proxy_to_broker_url,
+                        executor,
+                        operation_timeout,
+                    )
+                    .await
+                } else {
+                    let stream = tokio::net::TcpStream::connect(&address)
+                        .await
+                        .map(|stream| tokio_util::codec::Framed::new(stream, Codec))?;
+
+                    Connection::connect(
+                        connection_id,
+                        stream,
+                        auth,
+                        proxy_to_broker_url,
+                        executor,
+                        operation_timeout,
+                    )
+                    .await
+                }
+            }
+            #[cfg(all(not(feature = "tokio-runtime"), not(feature = "tokio-rustls-runtime")))]
             ExecutorKind::Tokio => {
                 unimplemented!("the tokio-runtime cargo feature is not active");
             }
@@ -932,6 +1026,9 @@ impl<Exe: Executor> Connection<Exe> {
                     let mut connector = async_native_tls::TlsConnector::new();
                     for certificate in certificate_chain {
                         connector = connector.add_root_certificate(certificate.clone());
+                    }
+                    if let Some(identity) = identity {
+                        connector = connector.identity(identity);
                     }
                     connector = connector.danger_accept_invalid_hostnames(
                         allow_insecure_connection && !tls_hostname_verification_enabled,
@@ -967,7 +1064,75 @@ impl<Exe: Executor> Connection<Exe> {
                     .await
                 }
             }
-            #[cfg(not(feature = "async-std-runtime"))]
+            #[cfg(all(
+                feature = "async-std-rustls-runtime",
+                not(feature = "async-std-runtime")
+            ))]
+            ExecutorKind::AsyncStd => {
+                if tls {
+                    let stream = async_std::net::TcpStream::connect(&address).await?;
+                    let mut root_store = rustls::RootCertStore::empty();
+                    for certificate in certificate_chain {
+                        root_store.add(certificate)?;
+                    }
+
+                    let trust_anchors = webpki_roots::TLS_SERVER_ROOTS.iter().fold(
+                        vec![],
+                        |mut acc, trust_anchor| {
+                            acc.push(
+                                rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
+                                    trust_anchor.subject,
+                                    trust_anchor.spki,
+                                    trust_anchor.name_constraints,
+                                ),
+                            );
+                            acc
+                        },
+                    );
+
+                    root_store.add_trust_anchors(trust_anchors.into_iter());
+                    let config = rustls::ClientConfig::builder()
+                        .with_safe_default_cipher_suites()
+                        .with_safe_default_kx_groups()
+                        .with_safe_default_protocol_versions()?
+                        .with_root_certificates(root_store)
+                        .with_no_client_auth();
+
+                    let connector = async_rustls::TlsConnector::from(Arc::new(config));
+                    let stream = connector
+                        .connect(rustls::ServerName::try_from(hostname.as_str())?, stream)
+                        .await
+                        .map(|stream| asynchronous_codec::Framed::new(stream, Codec))?;
+
+                    Connection::connect(
+                        connection_id,
+                        stream,
+                        auth,
+                        proxy_to_broker_url,
+                        executor,
+                        operation_timeout,
+                    )
+                    .await
+                } else {
+                    let stream = async_std::net::TcpStream::connect(&address)
+                        .await
+                        .map(|stream| asynchronous_codec::Framed::new(stream, Codec))?;
+
+                    Connection::connect(
+                        connection_id,
+                        stream,
+                        auth,
+                        proxy_to_broker_url,
+                        executor,
+                        operation_timeout,
+                    )
+                    .await
+                }
+            }
+            #[cfg(all(
+                not(feature = "async-std-runtime"),
+                not(feature = "async-std-rustls-runtime")
+            ))]
             ExecutorKind::AsyncStd => {
                 unimplemented!("the async-std-runtime cargo feature is not active");
             }
@@ -1186,7 +1351,7 @@ pub(crate) mod messages {
                     auth_method_name,
                     auth_data,
                     proxy_to_broker_url,
-                    client_version: String::from("2.0.1-incubating"),
+                    client_version: proto::client_version(),
                     protocol_version: Some(12),
                     ..Default::default()
                 }),
@@ -1269,6 +1434,22 @@ pub(crate) mod messages {
                     namespace,
                     mode: Some(mode as i32),
                     ..Default::default()
+                }),
+                ..Default::default()
+            },
+            payload: None,
+        }
+    }
+
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub fn get_schema(request_id: u64, topic: &str, version: Option<Vec<u8>>) -> Message {
+        Message {
+            command: proto::BaseCommand {
+                r#type: CommandType::GetSchema as i32,
+                get_schema: Some(proto::CommandGetSchema {
+                    request_id,
+                    topic: topic.to_string(),
+                    schema_version: version,
                 }),
                 ..Default::default()
             },
@@ -1594,16 +1775,17 @@ mod tests {
     use uuid::Uuid;
 
     use super::{Connection, Receiver};
+    #[cfg(any(feature = "tokio-runtime", feature = "tokio-rustls-runtime"))]
+    use crate::TokioExecutor;
     use crate::{
         authentication::Authentication,
         error::{AuthenticationError, SharedError},
         message::{BaseCommand, Codec, Message},
         proto::{AuthData, CommandAuthChallenge, CommandAuthResponse, CommandConnected},
-        TokioExecutor,
     };
 
     #[tokio::test]
-    #[cfg(feature = "tokio-runtime")]
+    #[cfg(any(feature = "tokio-runtime", feature = "tokio-rustls-runtime"))]
     async fn receiver_auth_challenge_test() {
         let (message_tx, message_rx) = mpsc::unbounded();
         let (tx, _) = mpsc::unbounded();
@@ -1661,7 +1843,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "tokio-runtime")]
+    #[cfg(any(feature = "tokio-runtime", feature = "tokio-rustls-runtime"))]
     async fn connection_auth_challenge_test() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 
